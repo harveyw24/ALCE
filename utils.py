@@ -75,6 +75,7 @@ def make_demo(item, prompt, ndoc=None, doc_prompt=None, instruction=None, use_sh
     # - {INST}: the instruction
     # - {D}: the documents
     # - {Q}: the question
+    # - {PR}: the previous responses (for chaining)
     # - {A}: the answers
     # ndoc: number of documents to put in context
     # use_shorter: None, "summary", or "extraction"
@@ -91,6 +92,9 @@ def make_demo(item, prompt, ndoc=None, doc_prompt=None, instruction=None, use_sh
     if not test:
         answer = "\n" + "\n".join(item["answer"]) if isinstance(item["answer"], list) else item["answer"]
         prompt = prompt.replace("{A}", "").rstrip() + answer
+
+        if "{PR}" in prompt:
+            prompt = prompt.replace("{PR}", item["previous_response"])
     else:
         prompt = prompt.replace("{A}", "").rstrip() # remove any space or \n
 

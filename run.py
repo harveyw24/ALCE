@@ -16,6 +16,7 @@ import re
 from searcher import SearcherWithinDocs
 import yaml
 from utils import *
+import nltk
 from nltk import sent_tokenize
 
 def remove_citations(sent):
@@ -93,6 +94,7 @@ class LLM:
                     except Exception as error:
                         if retry_count <= 5:
                             logger.warning(f"OpenAI API retry for {retry_count} times ({error})")
+                            time.sleep(10)
                             continue
                         print(error)
                         import pdb; pdb.set_trace()
@@ -211,6 +213,13 @@ def main():
     parser.add_argument("--max_doc_show", type=int, default=3, help="Max number of documents to show at one time.")
     parser.add_argument("--force_cite_show", type=bool, default=False, help="Force citing the documents that are shown to the model")
 
+    # Chaining
+    parser.add_argument("--chaining", type=str, default=None, help="What kind of chaining to use, either `response_retrieve` or `retrieve_response`")
+
+    # Iterative improvement
+    parser.add_argument("--iterative", type=bool, default=False, help="Whether to use iterative improvement")
+    parser.add_argument("--niter", type=int, default=1, help="Number of iterations")
+
 
     # Load config
     args = parser.parse_args()
@@ -251,6 +260,7 @@ def main():
 
     # Generate the demonstration part
     head_prompt = ""
+    head_prompt2 = "" # for chaining
     train_ids = np.random.choice(len(prompt_data["demos"]), args.shot, replace=False)
     for train_id in train_ids:
         train_item = prompt_data["demos"][train_id]
@@ -260,11 +270,36 @@ def main():
         elif args.fewer_doc_in_demo:
             assert args.ndoc_in_demo is not None
             ndoc = args.ndoc_in_demo
-        head_prompt += make_demo(
-            train_item, prompt=prompt_data["demo_prompt"], ndoc=ndoc, doc_prompt=prompt_data["doc_prompt"], 
-            instruction=prompt_data["instruction"], use_shorter=args.use_shorter 
-        )
-        head_prompt += prompt_data["demo_sep"]
+
+        # Chaining requires two separate prompts and demos
+        if args.chaining is not None or args.iterative is not False:
+            train_item2 = prompt_data["demos2"][train_id]
+
+            # Response-Retrieve uses no documents for first step, ndoc docs for second
+            if args.chaining == "response_retrieve":
+                ndoc_first, ndoc_second = 0, ndoc
+            elif args.chaining == "retrieve_response":
+                ndoc_first, ndoc_second = ndoc, 0
+            else:
+                ndoc_first, ndoc_second = ndoc, ndoc
+
+            head_prompt += make_demo(
+                train_item, prompt=prompt_data["demo_prompt"], ndoc=ndoc_first, doc_prompt=prompt_data["doc_prompt"],
+                instruction=prompt_data["instruction"], use_shorter=args.use_shorter
+            )
+            head_prompt += prompt_data["demo_sep"]
+
+            head_prompt2 += make_demo(
+                train_item2, prompt=prompt_data["demo_prompt2"], ndoc=ndoc_second, doc_prompt=prompt_data["doc_prompt"],
+                instruction=prompt_data["instruction2"], use_shorter=args.use_shorter
+            )
+            head_prompt2 += prompt_data["demo_sep"]
+        else:
+            head_prompt += make_demo(
+                train_item, prompt=prompt_data["demo_prompt"], ndoc=ndoc, doc_prompt=prompt_data["doc_prompt"], 
+                instruction=prompt_data["instruction"], use_shorter=args.use_shorter 
+            )
+            head_prompt += prompt_data["demo_sep"]
 
     # Sample quick test
     if args.quick_test is not None:
@@ -274,11 +309,31 @@ def main():
     logger.info("Generating prompts...") 
     incomplete_doc_list = 0 # For some questions there might be fewer than ndoc documents
     for idx, eval_item in enumerate(tqdm(eval_data)):
-        eval_data[idx]['prompt'] = head_prompt + make_demo(
-            eval_item, prompt=prompt_data["demo_prompt"], ndoc=args.ndoc, doc_prompt=prompt_data["doc_prompt"],
-            instruction=prompt_data["instruction"], use_shorter=args.use_shorter, 
-            test=True
-        )
+        # Two prompts for chaining
+        if args.chaining is not None or args.iterative is not False:
+            # Response-Retrieve uses no documents for first step, ndoc docs for second
+            if args.chaining == "response_retrieve":
+                ndoc_first, ndoc_second = 0, ndoc
+            elif args.chaining == "retrieve_response":
+                ndoc_first, ndoc_second = ndoc, 0
+            else:
+                ndoc_first, ndoc_second = ndoc, ndoc
+
+            # Chaining requires two separate prompts and demos
+            eval_data[idx]['prompt'] = head_prompt + make_demo(
+                eval_item, prompt=prompt_data["demo_prompt"], ndoc=ndoc_first, doc_prompt=prompt_data["doc_prompt"],
+                instruction=prompt_data["instruction"], use_shorter=args.use_shorter, test=True
+            )
+            eval_data[idx]['prompt2'] = head_prompt2 + make_demo(
+                eval_item, prompt=prompt_data["demo_prompt2"], ndoc=ndoc_second, doc_prompt=prompt_data["doc_prompt"],
+                instruction=prompt_data["instruction2"], use_shorter=args.use_shorter, test=True
+            )
+        else:
+            eval_data[idx]['prompt'] = head_prompt + make_demo(
+                eval_item, prompt=prompt_data["demo_prompt"], ndoc=args.ndoc, doc_prompt=prompt_data["doc_prompt"],
+                instruction=prompt_data["instruction"], use_shorter=args.use_shorter, 
+                test=True
+            )
         doc_list = get_shorter_text(eval_item, eval_item["docs"], args.ndoc, args.use_shorter) if args.use_shorter is not None else eval_item["docs"][:args.ndoc]
         if not args.retrieve_in_all_docs:
             # If --retrieve_in_all_docs, we keep the original docs and do not trim them by ndoc
@@ -295,10 +350,14 @@ def main():
         from sentence_transformers import SentenceTransformer
         gtr_model = SentenceTransformer(f'sentence-transformers/{args.retriever}', device=args.retriever_device)
         from searcher import SearcherWithinDocs
+        nltk.download('punkt')
 
     for idx, item in enumerate(tqdm(eval_data)):
         prompt = item['prompt']
         prompt_len = len(llm.tokenizer.tokenize(prompt))
+
+        if args.chaining is not None or args.iterative is not False:
+            prompt2 = item['prompt2']
 
         if idx == 0:
             print(prompt)
@@ -389,6 +448,33 @@ def main():
                 output_array.append(output_answer)
                 item['prompt'] = interactive_prompt
                 item['doc_history'] = doc_history
+            elif args.chaining is not None:
+                # Generate first response, use in second prompt to generate second response
+                output1 = llm.generate(prompt, min(args.max_new_tokens, args.max_length-prompt_len))
+                logger.info(f"First prompt length={prompt_len}")
+                logger.info(f"Model output: \"{output1}\"")
+
+                newprompt = prompt2.replace("{PR}", output1)
+                prompt_len = len(llm.tokenizer.tokenize(newprompt))
+                # logger.info(f"Prompt 2: \"{newprompt}\"")
+                output_array.append(llm.generate(newprompt, min(args.max_new_tokens, args.max_length-prompt_len)))
+                item['prompt'] = prompt
+                item['prompt2'] = newprompt
+            elif args.iterative is not False:
+                # Generate first response, use in second prompt to generate second response
+                output = llm.generate(prompt, min(args.max_new_tokens, args.max_length-prompt_len))
+                logger.info(f"First prompt length={prompt_len}")
+
+                # Repeatedly iterate on previous outputs for niter times
+                for _ in range(args.niter - 1):
+                    newprompt = prompt2.replace("{PR}", output)
+                    prompt_len = len(llm.tokenizer.tokenize(newprompt))
+                    output = llm.generate(newprompt, min(args.max_new_tokens, args.max_length-prompt_len))
+                    logger.info(f"Model output: \"{output}\"")
+                
+                output_array.append(output)
+                item['prompt'] = prompt
+                item['prompt2'] = newprompt
             else: 
                 output_array.append(llm.generate(prompt, min(args.max_new_tokens, args.max_length-prompt_len)))
                 item['prompt'] = prompt
@@ -424,6 +510,10 @@ def main():
         name += f"-sample{args.num_samples}"
     if args.force_cite_show:
         name += f"-forceciteshow"
+    if args.chaining:
+        name += f"-{args.chaining}"
+    if args.iterative:
+        name += f"-iterative{args.niter}"
 
     
     eval_data = {
